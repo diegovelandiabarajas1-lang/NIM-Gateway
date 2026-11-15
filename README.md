@@ -57,5 +57,10 @@ node --test test/gateway.test.js
 ```
 Usa un servidor falso que imita los fallos (cuelgue, 429, 500, 403, corte a mitad, etiquetas `<think>`).
 
+## Seguridad
+- La pasarela **no guarda ninguna clave**: reenvia la cabecera `Authorization` que manda OpenCode. Si la peticion no la trae, usa la variable de entorno `NVIDIA_API_KEY` (opcional).
+- Escucha en `0.0.0.0` para que un contenedor Docker llegue a ella; no tiene autenticacion propia, asi que no la expongas a internet. Para uso solo local, pon `"host": "127.0.0.1"` en `config.json`.
+- `logs/gateway.jsonl` guarda modelo, tiempos, tokens y errores, pero nunca el contenido de los mensajes ni las claves.
+
 ## Licencia
-Apache License 2.0.
+[Apache License 2.0](LICENSE). Copyright 2026 Diego Velandia Barajas.
