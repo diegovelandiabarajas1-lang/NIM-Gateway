@@ -1,0 +1,9 @@
+{
+  "name": "nim-gateway",
+  "version": "0.1.0",
+  "private": true,
+  "license": "Apache-2.0",
+  "type": "module",
+  "description": "Pasarela para NVIDIA NIM: tiempos maximos, reintentos, cambio de modelo, limpieza del razonamiento y estadisticas",
+  "scripts": { "start": "node gateway.js", "test": "node --test test/gateway.test.js" }
+}

@@ -1,0 +1,34 @@
+{
+    "port":  8780,
+    "upstream":  "https://integrate.api.nvidia.com/v1",
+    "firstByteTimeoutMs":  30000,
+    "idleTimeoutMs":  90000,
+    "nonStreamTimeoutMs":  180000,
+    "retries":  2,
+    "maxConcurrent":  3,
+    "defaultMaxTokens":  16384,
+    "normalizeReasoning":  true,
+    "fallbacks":  {
+                      "nvidia/nemotron-3-ultra-550b-a55b":  [
+                                                                "nvidia/nemotron-3.5-lightning-30b-a3b",
+                                                                "z-ai/glm-5.3-flash"
+                                                            ],
+                      "nvidia/nemotron-3.5-lightning-30b-a3b":  [
+                                                                    "z-ai/glm-5.3-flash"
+                                                                ],
+                      "openai/gpt-oss-20b":  [
+                                                 "nvidia/nemotron-3.5-lightning-30b-a3b"
+                                             ],
+                      "deepseek-ai/deepseek-v4.1-flash":  [
+                                                              "nvidia/nemotron-3.5-lightning-30b-a3b"
+                                                          ]
+                  },
+    "models":  {
+                   "openai/gpt-oss-20b":  {
+                                              "firstByteTimeoutMs":  12000
+                                          },
+                   "deepseek-ai/deepseek-v4.1-flash":  {
+                                                           "firstByteTimeoutMs":  12000
+                                                       }
+               }
+}
