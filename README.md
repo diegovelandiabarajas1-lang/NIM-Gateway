@@ -15,7 +15,7 @@ No guarda ninguna clave: reenvia la cabecera `Authorization` que manda OpenCode.
 - **Cola:** limita las peticiones simultaneas hacia NVIDIA (`maxConcurrent`) para no provocar 429.
 - **Limite de salida:** si la peticion no trae `max_tokens`, pone `defaultMaxTokens` (evita llamadas a herramientas cortadas por un tope bajo).
 - **Razonamiento:** convierte `reasoning` y las etiquetas `<think>...</think>` en `reasoning_content`, que es lo que OpenCode entiende.
-- **Estadisticas:** `GET /stats` (por modelo: peticiones, errores, cambios de modelo, mediana del primer fragmento) y registro en `logs/gateway.jsonl`.
+- **Estadisticas:** `GET /stats` (por modelo: peticiones, errores, cambios de modelo, mediana del primer fragmento) y registro en `logs/gateway.jsonl`. Cuando NVIDIA rechaza una peticion (400, 422...) el motivo queda en el campo `error`.
 
 ## Uso
 ```bash
@@ -36,6 +36,7 @@ Y en el `opencode.json` del proyecto:
 |---|---|---|
 | `port` / `host` | 8780 / 0.0.0.0 | Donde escucha |
 | `firstByteTimeoutMs` | 45000 | Espera maxima hasta el primer fragmento |
+| `firstByteMsPer10kTokens` / `firstByteCapMs` | 1000 / 120000 | La espera del primer fragmento crece con el tamano de la conversacion (+1 s por cada 10k tokens estimados, con ese tope): las conversaciones largas tardan mas en empezar |
 | `idleTimeoutMs` | 90000 | Silencio maximo durante el stream |
 | `nonStreamTimeoutMs` | 180000 | Respuesta completa sin stream |
 | `retries` | 2 | Reintentos por modelo (429, 5xx, red) |

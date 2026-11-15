@@ -19,6 +19,8 @@ export const DEFAULTS = {
   nonStreamTimeoutMs: 180000, // respuesta completa cuando no hay stream
   retries: 2, // reintentos por modelo ante 429 / 5xx / red
   retryAfterCapMs: 15000,
+  firstByteMsPer10kTokens: 1000, // espera extra por cada 10k tokens estimados de entrada (conversaciones largas tardan mas en empezar)
+  firstByteCapMs: 120000, // tope de la espera ampliada
   maxConcurrent: 3, // peticiones simultaneas hacia NVIDIA
   queueTimeoutMs: 120000,
   defaultMaxTokens: 16384, // si la peticion no trae max_tokens
@@ -141,7 +143,11 @@ export function createGateway(cfgIn = {}) {
     const headers = { "content-type": "application/json", accept: wantStream ? "text/event-stream" : "application/json" };
     if (auth) headers.authorization = auth;
 
-    arm(wantStream ? m.firstByteTimeoutMs : cfg.nonStreamTimeoutMs, wantStream ? `sin respuesta en ${Math.round(m.firstByteTimeoutMs / 1000)} s` : `sin respuesta en ${Math.round(cfg.nonStreamTimeoutMs / 1000)} s`);
+    // La espera hasta el primer fragmento crece con el tamano de la conversacion (~4 caracteres por token).
+    const estTokens = Math.round(JSON.stringify(body.messages ?? "").length / 4);
+    const firstByteMs = Math.min(m.firstByteTimeoutMs + Math.floor(estTokens / 10000) * (cfg.firstByteMsPer10kTokens || 0), Math.max(cfg.firstByteCapMs, m.firstByteTimeoutMs));
+    state.estTokens = estTokens;
+    arm(wantStream ? firstByteMs : cfg.nonStreamTimeoutMs, wantStream ? `sin respuesta en ${Math.round(firstByteMs / 1000)} s` : `sin respuesta en ${Math.round(cfg.nonStreamTimeoutMs / 1000)} s`);
     let up;
     try {
       up = await fetch(`${cfg.upstream}/chat/completions`, { method: "POST", headers, body: JSON.stringify(buildBody(body, model)), signal: ac.signal });
@@ -245,13 +251,14 @@ export function createGateway(cfgIn = {}) {
         for (let a = 0; a <= cfg.retries; a++) {
           if (clientGone) break outer;
           const r = await tryOnce({ req, res, auth, body, model: m, wantStream, t0, state });
-          state.attempts.push({ model: m, result: r.done ? "ok" : r.fail, ms: Date.now() - t0 });
+          state.attempts.push({ model: m, result: r.done ? "ok" : r.fail, ms: Date.now() - t0, ...(r.bodyText ? { detail: r.bodyText.replace(/\s+/g, " ").slice(0, 300) } : {}) });
           if (r.done) { result = r; break outer; }
           // errores que no tiene sentido reintentar ni cambiar de modelo: se devuelven tal cual
           if (r.status && !r.retriable && !r.unavailable) {
             res.writeHead(r.status, { "content-type": r.contentType || "application/json" });
             res.end(r.bodyText);
             result = { done: true, passthrough: r.status };
+            state.error = `HTTP ${r.status}: ${(r.bodyText || "").replace(/\s+/g, " ").slice(0, 300)}`; // motivo del rechazo de NVIDIA (sin claves ni mensajes del usuario)
             break outer;
           }
           if (r.unavailable) break; // 403/404: este modelo no esta disponible, pasa al siguiente
@@ -268,7 +275,7 @@ export function createGateway(cfgIn = {}) {
       res.end(JSON.stringify({ error: { message: `Pasarela: todos los intentos fallaron (${state.attempts.map((x) => `${x.model}: ${x.result}`).join("; ")})`, type: "gateway_error", attempts: state.attempts } }));
       state.error = last?.result;
     }
-    record({ ts: new Date().toISOString(), model, finalModel, stream: wantStream, ok, status: result?.passthrough ?? (ok ? 200 : 502), attempts: state.attempts.length, ttfbMs: state.ttfbMs ?? null, totalMs: Date.now() - t0, finish: state.finish ?? null, tokens: state.usage ? { in: state.usage.prompt_tokens, out: state.usage.completion_tokens } : null, error: state.error ?? null, clientGone });
+    record({ ts: new Date().toISOString(), model, finalModel, stream: wantStream, ok, status: result?.passthrough ?? (ok ? 200 : 502), attempts: state.attempts.length, estTokens: state.estTokens ?? null, ttfbMs: state.ttfbMs ?? null, totalMs: Date.now() - t0, finish: state.finish ?? null, tokens: state.usage ? { in: state.usage.prompt_tokens, out: state.usage.completion_tokens } : null, error: state.error ?? null, clientGone });
   }
 
   async function passthrough(req, res, raw) {

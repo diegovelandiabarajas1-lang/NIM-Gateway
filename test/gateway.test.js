@@ -178,6 +178,25 @@ test("cola: con maxConcurrent=1 las peticiones no se solapan", async () => {
   g.close();
 });
 
+test("la espera del primer fragmento crece con el tamano de la conversacion", async () => {
+  const g = await start({ fallbacks: { late: ["ok"] }, firstByteMsPer10kTokens: 1000 });
+  const b = `http://127.0.0.1:${g.address().port}/v1`;
+  const pedir = (contenido) => fetch(`${b}/chat/completions`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ model: "late", stream: true, messages: [{ role: "user", content: contenido }] }) });
+  // conversacion corta: el modelo lento (1,5 s) supera los 0,5 s y se sustituye
+  assert.equal((await pedir("hola")).headers.get("x-gateway-model"), "ok");
+  // conversacion de ~100k tokens (400k caracteres): +10 s de margen, el mismo modelo lento ya no se sustituye
+  assert.equal((await pedir("x".repeat(400000))).headers.get("x-gateway-model"), "late");
+  g.close();
+});
+
+test("un rechazo de NVIDIA deja su motivo en las estadisticas", async () => {
+  await ask("bad", { stream: false });
+  const st = await (await fetch(`${base.replace("/v1", "")}/stats`)).json();
+  const r = st.recent.filter((x) => x.model === "bad").at(-1);
+  assert.equal(r.status, 400);
+  assert.match(r.error, /peticion mala/);
+});
+
 test("/health y /stats responden", async () => {
   const root = base.replace("/v1", "");
   assert.equal((await (await fetch(`${root}/health`)).json()).ok, true);
