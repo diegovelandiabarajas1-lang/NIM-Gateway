@@ -11,6 +11,8 @@ No guarda ninguna clave: reenvia la cabecera `Authorization` que manda OpenCode.
 
 ## Que hace
 - **Tiempos maximos:** si un modelo no da ni un fragmento en `firstByteTimeoutMs`, o se queda mudo `idleTimeoutMs` en mitad de la respuesta, corta.
+- **Cortacircuitos:** si un modelo se cuelga repetidamente (`breakerFails` veces en `breakerWindowMs`), se pone en pausa `breakerCooldownMs` y las peticiones van directas a su alternativa, sin esperar de nuevo el tiempo maximo. Tras la pausa se prueba una vez y, si vuelve a fallar, se pausa otra vez. El panel muestra los modelos en pausa.
+- **Alternativas por defecto:** los modelos sin entrada propia en `fallbacks` usan `defaultFallbacks` (filtradas por tamano de contexto), de modo que ningun modelo se queda sin salida.
 - **Cambio de modelo:** si un modelo se cuelga o no esta disponible (403/404), pasa solo al siguiente de `fallbacks`. Con 429/5xx reintenta el mismo (respeta `Retry-After`).
 - **Estimacion calibrada:** la estimacion base (caracteres/4) se corrige con los tokens reales que NVIDIA devuelve en cada respuesta (`usage.prompt_tokens`), por modelo, y lo aprendido se guarda en `logs/calibration.json`. Con datos reales, los tokens son ~1,23 veces la estimacion base, y la pasarela lo aprende sola.
 - **Contexto excedido:** si la conversacion no cabe en ningun modelo conocido ni sin margen de seguridad, responde al instante `400 context_length_exceeded` (formato estandar de OpenAI) sin enviar nada a NVIDIA, para que el cliente (p. ej. OpenCode) compacte la conversacion. Se desactiva con `"rejectWhenTooLarge": false`. No compacta ella misma: reescribir la conversacion es cosa del cliente.
@@ -55,6 +57,9 @@ Y en el `opencode.json` del proyecto:
 | `idleTimeoutMs` | 90000 | Silencio maximo durante el stream |
 | `nonStreamTimeoutMs` | 180000 | Respuesta completa sin stream |
 | `retries` | 2 | Reintentos por modelo (429, 5xx, red) |
+| `defaultFallbacks` | [] | Alternativas para los modelos sin entrada propia en `fallbacks` |
+| `timeoutRetries` | 1 | Reintentos del mismo modelo tras un cuelgue cuando no hay alternativa (un modelo colgado rara vez se recupera) |
+| `breakerFails` / `breakerWindowMs` / `breakerCooldownMs` | 2 / 600000 / 300000 | Cuelgues que activan la pausa, ventana en que cuentan y duracion de la pausa |
 | `maxConcurrent` | 3 | Peticiones simultaneas |
 | `defaultMaxTokens` | 16384 | Si falta `max_tokens` |
 | `normalizeReasoning` | true | Limpieza del razonamiento |

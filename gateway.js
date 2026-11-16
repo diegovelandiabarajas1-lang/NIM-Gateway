@@ -21,6 +21,11 @@ export const DEFAULTS = {
   retryAfterCapMs: 15000,
   firstByteMsPer10kTokens: 1000, // espera extra por cada 10k tokens estimados de entrada (conversaciones largas tardan mas en empezar)
   firstByteCapMs: 120000, // tope de la espera ampliada
+  defaultFallbacks: [], // alternativas para los modelos que no tienen entrada propia en "fallbacks" (se filtran por tamano de contexto)
+  timeoutRetries: 1, // reintentos del mismo modelo tras un cuelgue, solo si no hay alternativa (un modelo colgado rara vez se recupera)
+  breakerFails: 2, // cuelgues seguidos de un modelo que lo ponen en pausa
+  breakerWindowMs: 600000, // ventana en la que cuentan esos cuelgues
+  breakerCooldownMs: 300000, // cuanto dura la pausa: las peticiones van directas a la alternativa
   announceSwitch: true, // cuando responde un modelo distinto al pedido, antepone un aviso visible a la respuesta
   allowEnvKey: false, // true = si la peticion no trae clave, usar la variable NVIDIA_API_KEY (solo si la pasarela NO es accesible desde la red)
   routeBySize: true, // elegir modelo segun el tamano de la conversacion
@@ -129,6 +134,7 @@ async function cargar(){
       '<div class="card"><b>'+r.length+'</b><span>últimas peticiones</span></div>'+
       '<div class="card"><b>'+cambios+'</b><span>con cambio de modelo</span></div>'+
       '<div class="card"><b>'+errores+'</b><span>con error</span></div>'+
+      Object.entries(d.paused||{}).map(([k,s])=>'<div class="card" style="border-color:#c9302c"><b>⏸ '+esc(corto(k))+'</b><span>en pausa por cuelgues · '+Math.ceil(s/60)+' min</span></div>').join("")+
       Object.entries(d.models).map(([k,v])=>'<div class="card"><b>'+v.requests+'</b><span>'+esc(corto(k))+' · '+v.fallbacks+' cambios · '+ms(v.ttfbMedianMs)+'</span></div>').join("");
     document.getElementById("filas").innerHTML=r.map(x=>{
       const cambio=x.finalModel!==x.model;
@@ -174,6 +180,16 @@ export function createGateway(cfgIn = {}) {
     if (r.ttfbMs != null) { a.ttfb.push(r.ttfbMs); if (a.ttfb.length > 100) a.ttfb.shift(); }
     if (cfg.logFile) { try { fs.mkdirSync(path.dirname(cfg.logFile), { recursive: true }); fs.appendFileSync(cfg.logFile, JSON.stringify(r) + "\n"); } catch { /* sin log */ } }
   };
+  // ---- cortacircuitos: un modelo que se cuelga repetidamente se pausa y las peticiones van directas a la alternativa ----
+  const breaker = {};
+  const isPaused = (m) => (breaker[m]?.openUntil ?? 0) > Date.now();
+  function trip(m) {
+    const b = (breaker[m] ??= { fails: [], openUntil: 0 });
+    const now = Date.now();
+    if (b.openUntil && now >= b.openUntil) { b.openUntil = now + cfg.breakerCooldownMs; return; } // volvio a fallar tras la pausa: otra pausa inmediata
+    b.fails = b.fails.filter((t) => now - t < cfg.breakerWindowMs); b.fails.push(now);
+    if (b.fails.length >= cfg.breakerFails) { b.openUntil = now + cfg.breakerCooldownMs; b.fails = []; console.log(`[pasarela] ${m} en pausa ${Math.round(cfg.breakerCooldownMs / 1000)} s tras cuelgues repetidos`); }
+  }
   const median = (xs) => (xs.length ? [...xs].sort((x, y) => x - y)[Math.floor(xs.length / 2)] : null);
 
   const mcfg = (model) => ({
@@ -221,9 +237,11 @@ export function createGateway(cfgIn = {}) {
 
   // Aviso visible cuando responde un modelo distinto al que pidio el cliente (OpenCode solo muestra el que elegiste).
   function noticeText(state, requested, actual) {
-    const why = state.routedBy
+    const why = state.routedBy === "contexto"
       ? "su contexto no admitía la conversación"
-      : (state.attempts.find((a) => a.model === requested && a.result !== "ok")?.result ?? "no respondió");
+      : state.routedBy === "pausa"
+        ? "estaba en pausa por cuelgues recientes"
+        : (state.attempts.find((a) => a.model === requested && a.result !== "ok")?.result ?? "no respondió");
     return `[Pasarela: respondió ${actual} en lugar de ${requested} (${why})]\n\n`;
   }
 
@@ -337,7 +355,7 @@ export function createGateway(cfgIn = {}) {
 
     // Cadena de modelos: el pedido, sus alternativas y, si hace falta, modelos de contexto grande.
     const uniq = (xs) => [...new Set(xs)];
-    let chain = uniq([model, ...(cfg.fallbacks[model] || [])]);
+    let chain = uniq([model, ...(cfg.fallbacks[model] ?? cfg.defaultFallbacks)]);
     const be = baseEstimate(body);
     state.est = be.est; state.ratio = ratioOf(model);
     state.need = needFor(be, model, cfg.contextMargin);
@@ -360,6 +378,12 @@ export function createGateway(cfgIn = {}) {
         return;
       }
     }
+    // Modelos en pausa por cuelgues recientes: se prueban los ultimos (solo si no hay otra salida).
+    const enPausa = chain.filter(isPaused);
+    if (enPausa.length && enPausa.length < chain.length) {
+      chain = [...chain.filter((m) => !isPaused(m)), ...enPausa];
+      if (chain[0] !== model && enPausa.includes(model)) state.routedBy ??= "pausa";
+    }
     let clientGone = false;
     res.on("close", () => { if (!res.writableEnded) { clientGone = true; state.abort?.(); } });
 
@@ -378,6 +402,7 @@ export function createGateway(cfgIn = {}) {
           const r = await tryOnce({ req, res, auth, body, model: m, wantStream, t0, state });
           state.attempts.push({ model: m, result: r.done ? "ok" : r.fail, ms: Date.now() - t0, ...(r.bodyText ? { detail: r.bodyText.replace(/\s+/g, " ").slice(0, 300) } : {}) });
           if (r.done) { result = r; break outer; }
+          if (r.timeout) trip(m);
           // errores que no tiene sentido reintentar ni cambiar de modelo: se devuelven tal cual
           if (r.status && !r.retriable && !r.unavailable) {
             res.writeHead(r.status, { "content-type": r.contentType || "application/json" });
@@ -388,13 +413,15 @@ export function createGateway(cfgIn = {}) {
           }
           if (r.unavailable) break; // 403/404: este modelo no esta disponible, pasa al siguiente
           if (r.timeout && hasFallback) break; // un modelo colgado: no insistir, cambiar
-          if (a < cfg.retries) await sleep(Math.min(r.retryAfterMs ?? 1000 * 2 ** a, cfg.retryAfterCapMs));
+          if (a >= (r.timeout ? cfg.timeoutRetries : cfg.retries)) break; // sin mas reintentos para este modelo
+          await sleep(Math.min(r.retryAfterMs ?? 1000 * 2 ** a, cfg.retryAfterCapMs));
         }
       }
     } finally { sem.release(); }
 
-    const ok = !!result?.done && !result.passthrough && !state.interrupted;
-    if (ok) learn(finalModel, state.est ?? 0, state.usage); // aprende cuantos tokens reales cuenta NVIDIA por cada estimado
+    const ok = !!result?.done && !result.passthrough && !state.interrupted && !clientGone;
+    if (ok) { delete breaker[finalModel]; learn(finalModel, state.est ?? 0, state.usage); } // aprende cuantos tokens reales cuenta NVIDIA por cada estimado
+    if (clientGone && !state.error) state.error = `cancelado por el cliente a los ${Math.round((Date.now() - t0) / 1000)} s sin respuesta`;
     if (!result?.done && !clientGone) {
       const last = state.attempts.at(-1);
       res.writeHead(502, { "content-type": "application/json" });
@@ -402,9 +429,9 @@ export function createGateway(cfgIn = {}) {
       state.error = last?.result;
     }
     const switchReason = finalModel !== model
-      ? (state.routedBy ? "tamaño de contexto" : `fallo: ${state.attempts.find((a) => a.model === model && a.result !== "ok")?.result ?? "sin respuesta"}`)
+      ? (state.routedBy === "contexto" ? "tamaño de contexto" : state.routedBy === "pausa" ? "modelo en pausa (fallos recientes)" : `fallo: ${state.attempts.find((a) => a.model === model && a.result !== "ok")?.result ?? "sin respuesta"}`)
       : null;
-    record({ ts: new Date().toISOString(), model, finalModel, switchReason, stream: wantStream, ok, status: result?.passthrough ?? (ok ? 200 : 502), attempts: state.attempts.length, est: state.est ?? null, ratio: state.ratio ? Math.round(state.ratio * 100) / 100 : null, need: state.need ?? null, routedBy: state.routedBy ?? null, ttfbMs: state.ttfbMs ?? null, totalMs: Date.now() - t0, finish: state.finish ?? null, tokens: state.usage ? { in: state.usage.prompt_tokens, out: state.usage.completion_tokens } : null, error: state.error ?? null, clientGone });
+    record({ ts: new Date().toISOString(), model, finalModel, switchReason, stream: wantStream, ok, status: result?.passthrough ?? (ok ? 200 : clientGone ? 499 : 502), attempts: state.attempts.length, est: state.est ?? null, ratio: state.ratio ? Math.round(state.ratio * 100) / 100 : null, need: state.need ?? null, routedBy: state.routedBy ?? null, ttfbMs: state.ttfbMs ?? null, totalMs: Date.now() - t0, finish: state.finish ?? null, tokens: state.usage ? { in: state.usage.prompt_tokens, out: state.usage.completion_tokens } : null, error: state.error ?? null, clientGone });
   }
 
   async function passthrough(req, res, raw) {
@@ -426,7 +453,8 @@ export function createGateway(cfgIn = {}) {
       const models = Object.fromEntries(Object.entries(agg).map(([k, v]) => [k, { requests: v.requests, ok: v.ok, errors: v.errors, fallbacks: v.fallbacks, ttfbMedianMs: median(v.ttfb) }]));
       res.writeHead(200, { "content-type": "application/json" });
       const n = Math.min(200, Number(new URL(req.url, "http://x").searchParams.get("n")) || 20);
-      res.end(JSON.stringify({ models, recent: recent.slice(-n) }, null, 2));
+      const paused = Object.fromEntries(Object.keys(breaker).filter(isPaused).map((m) => [m, Math.ceil((breaker[m].openUntil - Date.now()) / 1000)]));
+      res.end(JSON.stringify({ models, paused, recent: recent.slice(-n) }, null, 2));
       return;
     }
     let raw = "";

@@ -14,14 +14,22 @@
                                                                 "z-ai/glm-5.3-flash"
                                                             ],
                       "nvidia/nemotron-3.5-lightning-30b-a3b":  [
-                                                                    "z-ai/glm-5.3-flash"
+                                                                    "nvidia/nemotron-3-ultra-550b-a55b"
                                                                 ],
                       "openai/gpt-oss-20b":  [
                                                  "nvidia/nemotron-3.5-lightning-30b-a3b"
                                              ],
                       "deepseek-ai/deepseek-v4.1-flash":  [
                                                               "nvidia/nemotron-3.5-lightning-30b-a3b"
-                                                          ]
+                                                          ],
+                      "z-ai/glm-5.3-flash":  [
+                                                 "nvidia/nemotron-3-ultra-550b-a55b",
+                                                 "nvidia/nemotron-3.5-lightning-30b-a3b"
+                                             ],
+                      "z-ai/glm-5.3":  [
+                                           "nvidia/nemotron-3-ultra-550b-a55b",
+                                           "nvidia/nemotron-3.5-lightning-30b-a3b"
+                                       ]
                   },
     "models":  {
                    "openai/gpt-oss-20b":  {
@@ -37,5 +45,10 @@
                          "nvidia/nemotron-3-ultra-550b-a55b",
                          "z-ai/glm-5.3-flash",
                          "deepseek-ai/deepseek-v4.1-flash"
-                     ]
+                     ],
+    "defaultFallbacks":  [
+                             "nvidia/nemotron-3-ultra-550b-a55b",
+                             "nvidia/nemotron-3.5-lightning-30b-a3b"
+                         ],
+    "timeoutRetries":  1
 }

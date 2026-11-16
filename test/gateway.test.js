@@ -285,6 +285,60 @@ test("calibracion: aprende cuantos tokens reales cuenta NVIDIA y cambia la decis
     await r2.text();
   } finally { g.close(); }
 });
+test("modelo sin cadena propia: usa defaultFallbacks (el caso de GLM sin alternativa)", async () => {
+  const g = await start({ defaultFallbacks: ["ok"] }); // 'hang' no esta en fallbacks
+  try {
+    const r = await pedirA(g, "hang", "hola");
+    assert.equal(r.headers.get("x-gateway-model"), "ok");
+    assert.equal((await readSSE(r)).content, "Hola mundo");
+  } finally { g.close(); }
+});
+
+test("sin alternativa: un cuelgue se reintenta solo timeoutRetries veces, no 3", async () => {
+  const g = await start({ fallbacks: { hang: [] }, retries: 2, timeoutRetries: 1 });
+  try {
+    calls.hang = 0;
+    const r2 = await pedirA(g, "hang", "hola");
+    assert.equal(r2.status, 502);
+    assert.equal(calls.hang >= 2, true);
+    const j = await r2.json();
+    assert.equal(j.error.attempts.length, 2, "1 intento + 1 reintento, no 3");
+  } finally { g.close(); }
+});
+
+test("cortacircuitos: tras cuelgues repetidos el modelo se pausa y se va directo a la alternativa", async () => {
+  const g = await start({ fallbacks: { hang: ["ok"] }, breakerFails: 2 });
+  try {
+    for (let i = 0; i < 2; i++) { const r = await pedirA(g, "hang", "hola"); assert.equal(r.headers.get("x-gateway-attempts"), "2"); await r.text(); }
+    const t0 = Date.now();
+    const r3 = await pedirA(g, "hang", "hola");
+    assert.equal(r3.headers.get("x-gateway-model"), "ok");
+    assert.equal(r3.headers.get("x-gateway-attempts"), "1", "no debe volver a esperar al modelo pausado");
+    assert.equal(r3.headers.get("x-gateway-routed"), "pausa");
+    assert.ok(Date.now() - t0 < 300);
+    await r3.text();
+    const st = await (await fetch(`http://127.0.0.1:${g.address().port}/stats`)).json();
+    assert.ok(st.paused.hang > 0);
+    assert.equal(st.recent.at(-1).switchReason, "modelo en pausa (fallos recientes)");
+  } finally { g.close(); }
+});
+
+test("cancelacion: si el cliente se va sin respuesta, no cuenta como exito (499)", async () => {
+  const g = await start({ fallbacks: { hang: [] }, firstByteTimeoutMs: 5000 });
+  try {
+    const ac = new AbortController();
+    const b = `http://127.0.0.1:${g.address().port}/v1`;
+    const p = fetch(`${b}/chat/completions`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ model: "hang", stream: true, messages: [] }), signal: ac.signal }).catch(() => null);
+    await new Promise((r) => setTimeout(r, 200)); ac.abort(); await p;
+    await new Promise((r) => setTimeout(r, 300));
+    const st = await (await fetch(`http://127.0.0.1:${g.address().port}/stats`)).json();
+    const last = st.recent.at(-1);
+    assert.equal(last.ok, false);
+    assert.equal(last.status, 499);
+    assert.match(last.error, /cancelado por el cliente/);
+  } finally { g.close(); }
+});
+
 test("aviso: si responde otro modelo, la respuesta lo dice (stream y sin stream)", async () => {
   const g = await start({ announceSwitch: true, fallbacks: { hang: ["ok"] }, nonStreamTimeoutMs: 800 }); // sin stream, un modelo colgado espera nonStreamTimeoutMs
   try {
