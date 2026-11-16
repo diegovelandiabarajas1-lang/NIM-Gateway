@@ -12,6 +12,8 @@ No guarda ninguna clave: reenvia la cabecera `Authorization` que manda OpenCode.
 ## Que hace
 - **Tiempos maximos:** si un modelo no da ni un fragmento en `firstByteTimeoutMs`, o se queda mudo `idleTimeoutMs` en mitad de la respuesta, corta.
 - **Cambio de modelo:** si un modelo se cuelga o no esta disponible (403/404), pasa solo al siguiente de `fallbacks`. Con 429/5xx reintenta el mismo (respeta `Retry-After`).
+- **Enrutamiento por tamano de contexto:** estima los tokens de la peticion (mensajes + herramientas, con margen) y solo usa modelos cuya ventana de contexto la admite. Si el modelo pedido no cabe, pasa a uno que si (primero sus alternativas, despues `largeContext`). Las alternativas demasiado pequenas se saltan, sin perder tiempo en ellas. La respuesta lleva `x-gateway-model` y, si hubo desvio, `x-gateway-routed: contexto`. Los limites salen de `models.json` (se actualiza con `node update-models.mjs`, que lee models.dev).
+- **Limite de salida por modelo:** `max_tokens` nunca supera el maximo del modelo (si no, NVIDIA responde 422); el valor por defecto tambien lo respeta.
 - **Cola:** limita las peticiones simultaneas hacia NVIDIA (`maxConcurrent`) para no provocar 429.
 - **Limite de salida:** si la peticion no trae `max_tokens`, pone `defaultMaxTokens` (evita llamadas a herramientas cortadas por un tope bajo).
 - **Razonamiento:** convierte `reasoning` y las etiquetas `<think>...</think>` en `reasoning_content`, que es lo que OpenCode entiende.
@@ -37,6 +39,11 @@ Y en el `opencode.json` del proyecto:
 | `port` / `host` | 8780 / 0.0.0.0 | Donde escucha |
 | `firstByteTimeoutMs` | 45000 | Espera maxima hasta el primer fragmento |
 | `firstByteMsPer10kTokens` / `firstByteCapMs` | 1000 / 120000 | La espera del primer fragmento crece con el tamano de la conversacion (+1 s por cada 10k tokens estimados, con ese tope): las conversaciones largas tardan mas en empezar |
+| `routeBySize` | true | Elegir modelo segun el tamano de la conversacion |
+| `largeContext` | [] | Modelos de contexto grande, por orden de preferencia, a los que desviar si el pedido no cabe |
+| `contextMargin` / `outputReserve` | 1.2 / 4096 | Margen sobre la estimacion (4 caracteres por token es aproximado) y tokens reservados para la respuesta |
+| `contextWindows` / `outputLimits` | {} | `{ "modelo": tokens }` para sobrescribir `models.json` |
+| `allowEnvKey` | false | Usar `NVIDIA_API_KEY` cuando la peticion no trae clave (solo si la pasarela no es accesible desde la red) |
 | `idleTimeoutMs` | 90000 | Silencio maximo durante el stream |
 | `nonStreamTimeoutMs` | 180000 | Respuesta completa sin stream |
 | `retries` | 2 | Reintentos por modelo (429, 5xx, red) |
@@ -59,7 +66,7 @@ node --test test/gateway.test.js
 Usa un servidor falso que imita los fallos (cuelgue, 429, 500, 403, corte a mitad, etiquetas `<think>`).
 
 ## Seguridad
-- La pasarela **no guarda ninguna clave**: reenvia la cabecera `Authorization` que manda OpenCode. Si la peticion no la trae, usa la variable de entorno `NVIDIA_API_KEY` (opcional).
+- La pasarela **no guarda ninguna clave**: reenvia la cabecera `Authorization` que manda OpenCode. Si la peticion no trae clave, **no usa la del entorno**: como la pasarela escucha en la red, hacerlo dejaria que cualquiera que llegue al puerto gaste tu clave. Solo si la pasarela NO es accesible desde la red puedes activar `"allowEnvKey": true` para que use `NVIDIA_API_KEY`.
 - Escucha en `0.0.0.0` para que un contenedor Docker llegue a ella; no tiene autenticacion propia, asi que no la expongas a internet. Para uso solo local, pon `"host": "127.0.0.1"` en `config.json`.
 - `logs/gateway.jsonl` guarda modelo, tiempos, tokens y errores, pero nunca el contenido de los mensajes ni las claves.
 

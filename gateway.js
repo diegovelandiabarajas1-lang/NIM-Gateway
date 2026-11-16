@@ -21,6 +21,14 @@ export const DEFAULTS = {
   retryAfterCapMs: 15000,
   firstByteMsPer10kTokens: 1000, // espera extra por cada 10k tokens estimados de entrada (conversaciones largas tardan mas en empezar)
   firstByteCapMs: 120000, // tope de la espera ampliada
+  allowEnvKey: false, // true = si la peticion no trae clave, usar la variable NVIDIA_API_KEY (solo si la pasarela NO es accesible desde la red)
+  routeBySize: true, // elegir modelo segun el tamano de la conversacion
+  largeContext: [], // modelos de contexto grande, por orden de preferencia, a los que desviar si el pedido no cabe
+  contextMargin: 1.2, // margen sobre la estimacion de tokens (4 caracteres por token es aproximado)
+  outputReserve: 4096, // tokens que se reservan para la respuesta al comprobar que cabe
+  contextWindows: {}, // { "modelo": tokens } sobrescribe models.json
+  outputLimits: {}, // { "modelo": tokens } sobrescribe models.json
+  modelsTable: {}, // se carga de models.json: { "modelo": { context, output } }
   maxConcurrent: 3, // peticiones simultaneas hacia NVIDIA
   queueTimeoutMs: 120000,
   defaultMaxTokens: 16384, // si la peticion no trae max_tokens
@@ -31,9 +39,11 @@ export const DEFAULTS = {
 };
 
 export function loadConfig(file = path.join(here, "config.json")) {
-  let user = {};
+  let user = {}, table = {};
   try { user = JSON.parse(fs.readFileSync(file, "utf8")); } catch { /* sin config: valores por defecto */ }
-  return { ...DEFAULTS, ...user };
+  // models.json lo genera update-models.mjs a partir de models.dev (contexto y salida maximos de cada modelo)
+  try { table = JSON.parse(fs.readFileSync(path.join(path.dirname(file), "models.json"), "utf8")); } catch { /* sin tabla: no se filtra por tamano */ }
+  return { ...DEFAULTS, modelsTable: table, ...user };
 }
 
 // ---------- razonamiento ----------
@@ -126,10 +136,24 @@ export function createGateway(cfgIn = {}) {
     ...(cfg.models[model] || {}),
   });
 
+  // contexto y salida maximos del modelo (Infinity / null si no se conocen: entonces no se filtra ni se recorta)
+  const windowOf = (id) => cfg.contextWindows[id] ?? cfg.modelsTable[id]?.context ?? Infinity;
+  const outputOf = (id) => cfg.outputLimits[id] ?? cfg.modelsTable[id]?.output ?? null;
+  // tokens que necesita el pedido: estimacion de la entrada (~4 caracteres por token) con margen, mas la salida reservada
+  function estimateNeed(body) {
+    const chars = JSON.stringify(body.messages ?? "").length + (body.tools ? JSON.stringify(body.tools).length : 0);
+    const est = Math.round(chars / 4);
+    const asked = body.max_tokens ?? body.max_completion_tokens ?? cfg.outputReserve;
+    return { est, need: Math.ceil(est * cfg.contextMargin) + Math.min(asked, cfg.outputReserve) };
+  }
+
   function buildBody(body, model) {
     const m = mcfg(model);
+    const lim = outputOf(model);
     const out = { ...body, model };
-    if (out.max_tokens == null && out.max_completion_tokens == null && m.defaultMaxTokens) out.max_tokens = m.defaultMaxTokens;
+    // la salida pedida nunca puede pasar del maximo del modelo (si no, NVIDIA responde 422)
+    for (const k of ["max_tokens", "max_completion_tokens"]) if (lim && out[k] != null && out[k] > lim) out[k] = lim;
+    if (out.max_tokens == null && out.max_completion_tokens == null && m.defaultMaxTokens) out.max_tokens = lim ? Math.min(m.defaultMaxTokens, lim) : m.defaultMaxTokens;
     return m.patch ? { ...out, ...m.patch } : out;
   }
 
@@ -170,7 +194,7 @@ export function createGateway(cfgIn = {}) {
       let json; try { json = JSON.parse(text); } catch { return { fail: "respuesta no es JSON", retriable: true }; }
       if (cfg.normalizeReasoning) for (const c of json.choices || []) normalizeMessage(c.message);
       state.ttfbMs = Date.now() - t0; state.finish = json.choices?.[0]?.finish_reason; state.usage = json.usage;
-      res.writeHead(200, { "content-type": "application/json", "x-gateway-model": model, "x-gateway-attempts": String(state.attempts.length + 1) });
+      res.writeHead(200, { "content-type": "application/json", "x-gateway-model": model, "x-gateway-attempts": String(state.attempts.length + 1), ...(state.routedBy ? { "x-gateway-routed": state.routedBy } : {}) });
       res.end(JSON.stringify(json));
       return { done: true };
     }
@@ -184,7 +208,7 @@ export function createGateway(cfgIn = {}) {
       if (committed) return;
       committed = true;
       state.ttfbMs = Date.now() - t0;
-      res.writeHead(200, { "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-cache", connection: "keep-alive", "x-gateway-model": model, "x-gateway-attempts": String(state.attempts.length + 1) });
+      res.writeHead(200, { "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-cache", connection: "keep-alive", "x-gateway-model": model, "x-gateway-attempts": String(state.attempts.length + 1), ...(state.routedBy ? { "x-gateway-routed": state.routedBy } : {}) });
     };
     const processEvent = (ev) => {
       const line = ev.split("\n").find((l) => l.startsWith("data:"));
@@ -231,10 +255,24 @@ export function createGateway(cfgIn = {}) {
     try { body = JSON.parse(raw); } catch { res.writeHead(400, { "content-type": "application/json" }); res.end(JSON.stringify({ error: { message: "JSON invalido", type: "invalid_request_error" } })); return; }
     const model = body.model;
     const wantStream = body.stream === true;
-    const auth = req.headers.authorization || (process.env.NVIDIA_API_KEY ? `Bearer ${process.env.NVIDIA_API_KEY}` : "");
-    const chain = [model, ...(cfg.fallbacks[model] || [])];
+    // Solo se reenvia la clave del cliente. La clave del entorno exige activar allowEnvKey a proposito:
+    // como la pasarela escucha en la red, usarla por defecto dejaria que cualquiera gaste tu clave.
+    const auth = req.headers.authorization || (cfg.allowEnvKey && process.env.NVIDIA_API_KEY ? `Bearer ${process.env.NVIDIA_API_KEY}` : "");
     const t0 = Date.now();
     const state = { attempts: [], abort: null };
+
+    // Cadena de modelos: el pedido, sus alternativas y, si hace falta, modelos de contexto grande.
+    const uniq = (xs) => [...new Set(xs)];
+    let chain = uniq([model, ...(cfg.fallbacks[model] || [])]);
+    const { est, need } = estimateNeed(body);
+    state.need = need;
+    if (cfg.routeBySize) {
+      const fits = (m) => windowOf(m) >= need;
+      if (!chain.some(fits)) chain = uniq([...chain, ...cfg.largeContext]);
+      const ok = chain.filter(fits);
+      if (ok.length) { if (ok[0] !== model) state.routedBy = "contexto"; chain = ok; }
+      // si no cabe en ninguno se deja la cadena original: NVIDIA dara su propio error
+    }
     let clientGone = false;
     res.on("close", () => { if (!res.writableEnded) { clientGone = true; state.abort?.(); } });
 
@@ -275,7 +313,7 @@ export function createGateway(cfgIn = {}) {
       res.end(JSON.stringify({ error: { message: `Pasarela: todos los intentos fallaron (${state.attempts.map((x) => `${x.model}: ${x.result}`).join("; ")})`, type: "gateway_error", attempts: state.attempts } }));
       state.error = last?.result;
     }
-    record({ ts: new Date().toISOString(), model, finalModel, stream: wantStream, ok, status: result?.passthrough ?? (ok ? 200 : 502), attempts: state.attempts.length, estTokens: state.estTokens ?? null, ttfbMs: state.ttfbMs ?? null, totalMs: Date.now() - t0, finish: state.finish ?? null, tokens: state.usage ? { in: state.usage.prompt_tokens, out: state.usage.completion_tokens } : null, error: state.error ?? null, clientGone });
+    record({ ts: new Date().toISOString(), model, finalModel, stream: wantStream, ok, status: result?.passthrough ?? (ok ? 200 : 502), attempts: state.attempts.length, estTokens: state.estTokens ?? null, need: state.need ?? null, routedBy: state.routedBy ?? null, ttfbMs: state.ttfbMs ?? null, totalMs: Date.now() - t0, finish: state.finish ?? null, tokens: state.usage ? { in: state.usage.prompt_tokens, out: state.usage.completion_tokens } : null, error: state.error ?? null, clientGone });
   }
 
   async function passthrough(req, res, raw) {

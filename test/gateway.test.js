@@ -197,6 +197,74 @@ test("un rechazo de NVIDIA deja su motivo en las estadisticas", async () => {
   assert.match(r.error, /peticion mala/);
 });
 
+const GRANDE = "x".repeat(400000); // ~100k tokens
+const pedirA = async (g, model, contenido, extra = {}) => {
+  const b = `http://127.0.0.1:${g.address().port}/v1`;
+  return fetch(`${b}/chat/completions`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ model, stream: true, messages: [{ role: "user", content: contenido }], ...extra }) });
+};
+
+test("tamano: si el pedido no cabe en el modelo, se desvia a uno de contexto grande", async () => {
+  const g = await start({ contextWindows: { slow: 20000, ok: 1000000 }, largeContext: ["ok"], firstByteTimeoutMs: 2000, idleTimeoutMs: 2000 });
+  const corto = await pedirA(g, "slow", "hola");
+  assert.equal(corto.headers.get("x-gateway-model"), "slow");
+  assert.equal(corto.headers.get("x-gateway-routed"), null);
+  await corto.text();
+  const largo = await pedirA(g, "slow", GRANDE);
+  assert.equal(largo.headers.get("x-gateway-model"), "ok");
+  assert.equal(largo.headers.get("x-gateway-routed"), "contexto");
+  assert.equal((await readSSE(largo)).content, "Hola mundo");
+  const st = await (await fetch(`http://127.0.0.1:${g.address().port}/stats`)).json();
+  assert.equal(st.recent.at(-1).routedBy, "contexto");
+  g.close();
+});
+
+test("tamano: las alternativas que no caben se saltan (no se pierde tiempo en ellas)", async () => {
+  const g = await start({ contextWindows: { hang: 1000000, slow: 20000, ok: 1000000 }, fallbacks: { hang: ["slow", "ok"] }, firstByteMsPer10kTokens: 0 });
+  const t0 = Date.now();
+  const r = await pedirA(g, "hang", GRANDE);
+  assert.equal(r.headers.get("x-gateway-model"), "ok");
+  assert.equal(r.headers.get("x-gateway-attempts"), "2"); // hang (colgado) -> ok; 'slow' no se intento
+  assert.ok(Date.now() - t0 < 2500);
+  await r.text(); g.close();
+});
+
+test("tamano: si no cabe en ninguno se mantiene la cadena original", async () => {
+  const g = await start({ contextWindows: { slow: 20000 }, largeContext: [], firstByteTimeoutMs: 2000, idleTimeoutMs: 2000 });
+  const r = await pedirA(g, "slow", GRANDE);
+  assert.equal(r.headers.get("x-gateway-model"), "slow");
+  assert.equal(r.headers.get("x-gateway-routed"), null);
+  await r.text(); g.close();
+});
+
+test("tamano: routeBySize=false no desvia nada", async () => {
+  const g = await start({ routeBySize: false, contextWindows: { slow: 20000, ok: 1000000 }, largeContext: ["ok"], firstByteTimeoutMs: 2000, idleTimeoutMs: 2000 });
+  const r = await pedirA(g, "slow", GRANDE);
+  assert.equal(r.headers.get("x-gateway-model"), "slow");
+  await r.text(); g.close();
+});
+
+test("salida: max_tokens se recorta al maximo del modelo (evita el 422)", async () => {
+  const g = await start({ outputLimits: { echo: 100 }, defaultMaxTokens: 777 });
+  await (await pedirA(g, "echo", "hola", { max_tokens: 5000 })).text();
+  assert.equal(seen.echo.body.max_tokens, 100);
+  await (await pedirA(g, "echo", "hola")).text(); // sin max_tokens: el defecto tambien respeta el maximo
+  assert.equal(seen.echo.body.max_tokens, 100);
+  g.close();
+});
+
+test("seguridad: sin clave en la peticion NO se usa la del entorno (salvo allowEnvKey)", async () => {
+  process.env.NVIDIA_API_KEY = "clave-del-entorno";
+  const sinClave = (g) => fetch(`http://127.0.0.1:${g.address().port}/v1/chat/completions`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ model: "echo", stream: false, messages: [] }) }).then((r) => r.text());
+  const g1 = await start({});
+  seen.echo = undefined; await sinClave(g1);
+  assert.equal(seen.echo.auth, undefined, "no debe reenviar la clave del entorno por defecto");
+  const g2 = await start({ allowEnvKey: true });
+  await sinClave(g2);
+  assert.equal(seen.echo.auth, "Bearer clave-del-entorno");
+  g1.close(); g2.close();
+  delete process.env.NVIDIA_API_KEY;
+});
+
 test("/health y /stats responden", async () => {
   const root = base.replace("/v1", "");
   assert.equal((await (await fetch(`${root}/health`)).json()).ok, true);
