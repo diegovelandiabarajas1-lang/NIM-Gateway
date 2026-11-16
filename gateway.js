@@ -24,7 +24,10 @@ export const DEFAULTS = {
   allowEnvKey: false, // true = si la peticion no trae clave, usar la variable NVIDIA_API_KEY (solo si la pasarela NO es accesible desde la red)
   routeBySize: true, // elegir modelo segun el tamano de la conversacion
   largeContext: [], // modelos de contexto grande, por orden de preferencia, a los que desviar si el pedido no cabe
-  contextMargin: 1.2, // margen sobre la estimacion de tokens (4 caracteres por token es aproximado)
+  contextMargin: 1.05, // margen sobre la estimacion ya calibrada
+  initialTokenRatio: 1.25, // tokens reales / (caracteres/4) antes de aprender; se corrige con cada respuesta (usage.prompt_tokens)
+  rejectWhenTooLarge: true, // si la conversacion no cabe en ningun modelo conocido: devolver context_length_exceeded al instante (OpenCode la compacta)
+  calibrationFile: path.join(here, "logs", "calibration.json"), // donde se guarda lo aprendido entre reinicios (null = no guardar)
   outputReserve: 4096, // tokens que se reservan para la respuesta al comprobar que cabe
   contextWindows: {}, // { "modelo": tokens } sobrescribe models.json
   outputLimits: {}, // { "modelo": tokens } sobrescribe models.json
@@ -139,13 +142,29 @@ export function createGateway(cfgIn = {}) {
   // contexto y salida maximos del modelo (Infinity / null si no se conocen: entonces no se filtra ni se recorta)
   const windowOf = (id) => cfg.contextWindows[id] ?? cfg.modelsTable[id]?.context ?? Infinity;
   const outputOf = (id) => cfg.outputLimits[id] ?? cfg.modelsTable[id]?.output ?? null;
-  // tokens que necesita el pedido: estimacion de la entrada (~4 caracteres por token) con margen, mas la salida reservada
-  function estimateNeed(body) {
-    const chars = JSON.stringify(body.messages ?? "").length + (body.tools ? JSON.stringify(body.tools).length : 0);
-    const est = Math.round(chars / 4);
-    const asked = body.max_tokens ?? body.max_completion_tokens ?? cfg.outputReserve;
-    return { est, need: Math.ceil(est * cfg.contextMargin) + Math.min(asked, cfg.outputReserve) };
+  // ---- estimacion de tokens, calibrada con los tokens reales que devuelve NVIDIA ----
+  // estimacion base = caracteres/4; "ratio" = tokens reales / estimacion base, aprendido por modelo.
+  const ratios = {};
+  let globalRatio = cfg.initialTokenRatio;
+  if (cfg.calibrationFile) {
+    try { const c = JSON.parse(fs.readFileSync(cfg.calibrationFile, "utf8")); Object.assign(ratios, c.ratios || {}); if (c.global) globalRatio = c.global; } catch { /* sin calibracion previa */ }
   }
+  const ratioOf = (m) => ratios[m] ?? globalRatio;
+  function learn(model, est, usage) {
+    if (!usage?.prompt_tokens || est < 4000) return; // con poco texto el ruido de la plantilla distorsiona
+    const r = Math.min(3, Math.max(0.5, usage.prompt_tokens / est));
+    ratios[model] = ratios[model] == null ? r : 0.7 * ratios[model] + 0.3 * r;
+    globalRatio = 0.9 * globalRatio + 0.1 * r;
+    if (cfg.calibrationFile) { try { fs.mkdirSync(path.dirname(cfg.calibrationFile), { recursive: true }); fs.writeFileSync(cfg.calibrationFile, JSON.stringify({ global: globalRatio, ratios }, null, 2)); } catch { /* */ } }
+  }
+  // estimacion de la entrada (sin ratio) y salida reservada del pedido
+  function baseEstimate(body) {
+    const chars = JSON.stringify(body.messages ?? "").length + (body.tools ? JSON.stringify(body.tools).length : 0);
+    const asked = body.max_tokens ?? body.max_completion_tokens ?? cfg.outputReserve;
+    return { est: Math.round(chars / 4), reserve: Math.min(asked, cfg.outputReserve) };
+  }
+  // tokens que necesitaria el pedido en el modelo m (margen = 1 -> sin margen de seguridad)
+  const needFor = (b, m, margin) => Math.ceil(b.est * ratioOf(m) * margin) + b.reserve;
 
   function buildBody(body, model) {
     const m = mcfg(model);
@@ -167,8 +186,8 @@ export function createGateway(cfgIn = {}) {
     const headers = { "content-type": "application/json", accept: wantStream ? "text/event-stream" : "application/json" };
     if (auth) headers.authorization = auth;
 
-    // La espera hasta el primer fragmento crece con el tamano de la conversacion (~4 caracteres por token).
-    const estTokens = Math.round(JSON.stringify(body.messages ?? "").length / 4);
+    // La espera hasta el primer fragmento crece con el tamano de la conversacion (tokens reales esperados).
+    const estTokens = state.estReal ?? Math.round(JSON.stringify(body.messages ?? "").length / 4);
     const firstByteMs = Math.min(m.firstByteTimeoutMs + Math.floor(estTokens / 10000) * (cfg.firstByteMsPer10kTokens || 0), Math.max(cfg.firstByteCapMs, m.firstByteTimeoutMs));
     state.estTokens = estTokens;
     arm(wantStream ? firstByteMs : cfg.nonStreamTimeoutMs, wantStream ? `sin respuesta en ${Math.round(firstByteMs / 1000)} s` : `sin respuesta en ${Math.round(cfg.nonStreamTimeoutMs / 1000)} s`);
@@ -264,14 +283,27 @@ export function createGateway(cfgIn = {}) {
     // Cadena de modelos: el pedido, sus alternativas y, si hace falta, modelos de contexto grande.
     const uniq = (xs) => [...new Set(xs)];
     let chain = uniq([model, ...(cfg.fallbacks[model] || [])]);
-    const { est, need } = estimateNeed(body);
-    state.need = need;
+    const be = baseEstimate(body);
+    state.est = be.est; state.ratio = ratioOf(model);
+    state.need = needFor(be, model, cfg.contextMargin);
+    state.estReal = Math.round(be.est * ratioOf(model)); // tokens reales esperados (para la espera hasta el primer fragmento)
     if (cfg.routeBySize) {
-      const fits = (m) => windowOf(m) >= need;
+      const fits = (m) => windowOf(m) >= needFor(be, m, cfg.contextMargin);
+      const fitsBare = (m) => windowOf(m) >= needFor(be, m, 1); // sin margen: mas vale intentarlo que rechazar por poco
       if (!chain.some(fits)) chain = uniq([...chain, ...cfg.largeContext]);
-      const ok = chain.filter(fits);
+      let ok = chain.filter(fits);
+      if (!ok.length) ok = chain.filter(fitsBare);
       if (ok.length) { if (ok[0] !== model) state.routedBy = "contexto"; chain = ok; }
-      // si no cabe en ninguno se deja la cadena original: NVIDIA dara su propio error
+      else if (cfg.rejectWhenTooLarge && chain.every((m) => Number.isFinite(windowOf(m)))) {
+        // No cabe ni sin margen en ningun modelo conocido: no tiene sentido enviar megabytes a NVIDIA para que falle.
+        // Se devuelve el error estandar de "contexto excedido" para que el cliente (OpenCode) compacte la conversacion.
+        const max = Math.max(...chain.map(windowOf));
+        const msg = `This model's maximum context length is ${max} tokens. However, your messages resulted in about ${needFor(be, model, 1)} tokens. Please reduce the length of the messages.`;
+        res.writeHead(400, { "content-type": "application/json", "x-gateway-rejected": "context_length_exceeded" });
+        res.end(JSON.stringify({ error: { message: msg, type: "invalid_request_error", param: "messages", code: "context_length_exceeded" } }));
+        record({ ts: new Date().toISOString(), model, finalModel: model, stream: wantStream, ok: false, status: 400, attempts: 0, est: be.est, ratio: state.ratio, need: state.need, routedBy: null, ttfbMs: null, totalMs: Date.now() - t0, finish: null, tokens: null, error: `context_length_exceeded: ~${needFor(be, model, 1)} tokens > ${max}`, clientGone: false });
+        return;
+      }
     }
     let clientGone = false;
     res.on("close", () => { if (!res.writableEnded) { clientGone = true; state.abort?.(); } });
@@ -307,13 +339,14 @@ export function createGateway(cfgIn = {}) {
     } finally { sem.release(); }
 
     const ok = !!result?.done && !result.passthrough && !state.interrupted;
+    if (ok) learn(finalModel, state.est ?? 0, state.usage); // aprende cuantos tokens reales cuenta NVIDIA por cada estimado
     if (!result?.done && !clientGone) {
       const last = state.attempts.at(-1);
       res.writeHead(502, { "content-type": "application/json" });
       res.end(JSON.stringify({ error: { message: `Pasarela: todos los intentos fallaron (${state.attempts.map((x) => `${x.model}: ${x.result}`).join("; ")})`, type: "gateway_error", attempts: state.attempts } }));
       state.error = last?.result;
     }
-    record({ ts: new Date().toISOString(), model, finalModel, stream: wantStream, ok, status: result?.passthrough ?? (ok ? 200 : 502), attempts: state.attempts.length, estTokens: state.estTokens ?? null, need: state.need ?? null, routedBy: state.routedBy ?? null, ttfbMs: state.ttfbMs ?? null, totalMs: Date.now() - t0, finish: state.finish ?? null, tokens: state.usage ? { in: state.usage.prompt_tokens, out: state.usage.completion_tokens } : null, error: state.error ?? null, clientGone });
+    record({ ts: new Date().toISOString(), model, finalModel, stream: wantStream, ok, status: result?.passthrough ?? (ok ? 200 : 502), attempts: state.attempts.length, est: state.est ?? null, ratio: state.ratio ? Math.round(state.ratio * 100) / 100 : null, need: state.need ?? null, routedBy: state.routedBy ?? null, ttfbMs: state.ttfbMs ?? null, totalMs: Date.now() - t0, finish: state.finish ?? null, tokens: state.usage ? { in: state.usage.prompt_tokens, out: state.usage.completion_tokens } : null, error: state.error ?? null, clientGone });
   }
 
   async function passthrough(req, res, raw) {

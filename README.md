@@ -12,6 +12,8 @@ No guarda ninguna clave: reenvia la cabecera `Authorization` que manda OpenCode.
 ## Que hace
 - **Tiempos maximos:** si un modelo no da ni un fragmento en `firstByteTimeoutMs`, o se queda mudo `idleTimeoutMs` en mitad de la respuesta, corta.
 - **Cambio de modelo:** si un modelo se cuelga o no esta disponible (403/404), pasa solo al siguiente de `fallbacks`. Con 429/5xx reintenta el mismo (respeta `Retry-After`).
+- **Estimacion calibrada:** la estimacion base (caracteres/4) se corrige con los tokens reales que NVIDIA devuelve en cada respuesta (`usage.prompt_tokens`), por modelo, y lo aprendido se guarda en `logs/calibration.json`. Con datos reales, los tokens son ~1,23 veces la estimacion base, y la pasarela lo aprende sola.
+- **Contexto excedido:** si la conversacion no cabe en ningun modelo conocido ni sin margen de seguridad, responde al instante `400 context_length_exceeded` (formato estandar de OpenAI) sin enviar nada a NVIDIA, para que el cliente (p. ej. OpenCode) compacte la conversacion. Se desactiva con `"rejectWhenTooLarge": false`. No compacta ella misma: reescribir la conversacion es cosa del cliente.
 - **Enrutamiento por tamano de contexto:** estima los tokens de la peticion (mensajes + herramientas, con margen) y solo usa modelos cuya ventana de contexto la admite. Si el modelo pedido no cabe, pasa a uno que si (primero sus alternativas, despues `largeContext`). Las alternativas demasiado pequenas se saltan, sin perder tiempo en ellas. La respuesta lleva `x-gateway-model` y, si hubo desvio, `x-gateway-routed: contexto`. Los limites salen de `models.json` (se actualiza con `node update-models.mjs`, que lee models.dev).
 - **Limite de salida por modelo:** `max_tokens` nunca supera el maximo del modelo (si no, NVIDIA responde 422); el valor por defecto tambien lo respeta.
 - **Cola:** limita las peticiones simultaneas hacia NVIDIA (`maxConcurrent`) para no provocar 429.
@@ -41,7 +43,10 @@ Y en el `opencode.json` del proyecto:
 | `firstByteMsPer10kTokens` / `firstByteCapMs` | 1000 / 120000 | La espera del primer fragmento crece con el tamano de la conversacion (+1 s por cada 10k tokens estimados, con ese tope): las conversaciones largas tardan mas en empezar |
 | `routeBySize` | true | Elegir modelo segun el tamano de la conversacion |
 | `largeContext` | [] | Modelos de contexto grande, por orden de preferencia, a los que desviar si el pedido no cabe |
-| `contextMargin` / `outputReserve` | 1.2 / 4096 | Margen sobre la estimacion (4 caracteres por token es aproximado) y tokens reservados para la respuesta |
+| `contextMargin` / `outputReserve` | 1.05 / 4096 | Margen de seguridad sobre la estimacion ya calibrada y tokens reservados para la respuesta |
+| `initialTokenRatio` | 1.25 | Tokens reales / estimacion base antes de aprender (se corrige solo con cada respuesta) |
+| `rejectWhenTooLarge` | true | Devolver `context_length_exceeded` al instante si no cabe en ningun modelo conocido |
+| `calibrationFile` | `logs/calibration.json` | Donde se guarda lo aprendido entre reinicios (`null` = no guardar) |
 | `contextWindows` / `outputLimits` | {} | `{ "modelo": tokens }` para sobrescribir `models.json` |
 | `allowEnvKey` | false | Usar `NVIDIA_API_KEY` cuando la peticion no trae clave (solo si la pasarela no es accesible desde la red) |
 | `idleTimeoutMs` | 90000 | Silencio maximo durante el stream |

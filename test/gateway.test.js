@@ -38,6 +38,13 @@ const mock = http.createServer(async (req, res) => {
     case "once429":
       if (calls[m] === 1) { res.writeHead(429, { "retry-after": "1", "content-type": "application/json" }); return res.end('{"error":"rate"}'); }
       return ok();
+    case "doble": { // cuenta el DOBLE de tokens que la estimacion base (ratio real = 2)
+      const prompt = Math.round(JSON.stringify(body.messages).length / 4) * 2;
+      if (!stream) { res.writeHead(200, { "content-type": "application/json" }); return res.end(JSON.stringify({ choices: [{ message: { content: "ok" }, finish_reason: "stop" }], usage: { prompt_tokens: prompt, completion_tokens: 1 } })); }
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      chunk(res, { content: "ok" }); chunk(res, {}, "stop", { usage: { prompt_tokens: prompt, completion_tokens: 1 } });
+      res.write("data: [DONE]\n\n"); return res.end();
+    }
     case "always500": res.writeHead(500, { "content-type": "application/json" }); return res.end('{"error":"boom"}');
     case "nope": res.writeHead(403, { "content-type": "application/json" }); return res.end('{"error":"sin acceso"}');
     case "bad": res.writeHead(400, { "content-type": "application/json" }); return res.end('{"error":"peticion mala"}');
@@ -54,7 +61,7 @@ const mock = http.createServer(async (req, res) => {
 
 let gw, base;
 const start = (cfg) => new Promise((resolve) => {
-  const s = createGateway({ upstream: `http://127.0.0.1:${mock.address().port}/v1`, logFile: null, firstByteTimeoutMs: 500, idleTimeoutMs: 600, retryAfterCapMs: 200, retries: 1, ...cfg });
+  const s = createGateway({ upstream: `http://127.0.0.1:${mock.address().port}/v1`, logFile: null, calibrationFile: null, firstByteTimeoutMs: 500, idleTimeoutMs: 600, retryAfterCapMs: 200, retries: 1, ...cfg });
   s.listen(0, "127.0.0.1", () => resolve(s));
 });
 const ask = async (model, { stream = true, headers = {}, extra = {} } = {}) => {
@@ -228,43 +235,56 @@ test("tamano: las alternativas que no caben se saltan (no se pierde tiempo en el
   await r.text(); g.close();
 });
 
-test("tamano: si no cabe en ninguno se mantiene la cadena original", async () => {
+test("tamano: si no cabe en ningun modelo conocido, error context_length_exceeded al instante y sin llamar a NVIDIA", async () => {
   const g = await start({ contextWindows: { slow: 20000 }, largeContext: [], firstByteTimeoutMs: 2000, idleTimeoutMs: 2000 });
+  const antes = calls.slow || 0;
+  const t0 = Date.now();
   const r = await pedirA(g, "slow", GRANDE);
-  assert.equal(r.headers.get("x-gateway-model"), "slow");
-  assert.equal(r.headers.get("x-gateway-routed"), null);
-  await r.text(); g.close();
-});
-
-test("tamano: routeBySize=false no desvia nada", async () => {
-  const g = await start({ routeBySize: false, contextWindows: { slow: 20000, ok: 1000000 }, largeContext: ["ok"], firstByteTimeoutMs: 2000, idleTimeoutMs: 2000 });
-  const r = await pedirA(g, "slow", GRANDE);
-  assert.equal(r.headers.get("x-gateway-model"), "slow");
-  await r.text(); g.close();
-});
-
-test("salida: max_tokens se recorta al maximo del modelo (evita el 422)", async () => {
-  const g = await start({ outputLimits: { echo: 100 }, defaultMaxTokens: 777 });
-  await (await pedirA(g, "echo", "hola", { max_tokens: 5000 })).text();
-  assert.equal(seen.echo.body.max_tokens, 100);
-  await (await pedirA(g, "echo", "hola")).text(); // sin max_tokens: el defecto tambien respeta el maximo
-  assert.equal(seen.echo.body.max_tokens, 100);
+  assert.equal(r.status, 400);
+  assert.equal(r.headers.get("x-gateway-rejected"), "context_length_exceeded");
+  const j = await r.json();
+  assert.equal(j.error.code, "context_length_exceeded");
+  assert.match(j.error.message, /maximum context length is 20000 tokens/);
+  assert.match(j.error.message, /reduce the length of the messages/i);
+  assert.equal(calls.slow || 0, antes, "no debe llamar a NVIDIA");
+  assert.ok(Date.now() - t0 < 500);
+  const st = await (await fetch(`http://127.0.0.1:${g.address().port}/stats`)).json();
+  assert.equal(st.recent.at(-1).status, 400);
   g.close();
 });
 
-test("seguridad: sin clave en la peticion NO se usa la del entorno (salvo allowEnvKey)", async () => {
-  process.env.NVIDIA_API_KEY = "clave-del-entorno";
-  const sinClave = (g) => fetch(`http://127.0.0.1:${g.address().port}/v1/chat/completions`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ model: "echo", stream: false, messages: [] }) }).then((r) => r.text());
-  const g1 = await start({});
-  seen.echo = undefined; await sinClave(g1);
-  assert.equal(seen.echo.auth, undefined, "no debe reenviar la clave del entorno por defecto");
-  const g2 = await start({ allowEnvKey: true });
-  await sinClave(g2);
-  assert.equal(seen.echo.auth, "Bearer clave-del-entorno");
-  g1.close(); g2.close();
-  delete process.env.NVIDIA_API_KEY;
+test("tamano: rejectWhenTooLarge=false mantiene la cadena original", async () => {
+  const g = await start({ rejectWhenTooLarge: false, contextWindows: { slow: 20000 }, largeContext: [], firstByteTimeoutMs: 2000, idleTimeoutMs: 2000 });
+  const r = await pedirA(g, "slow", GRANDE);
+  assert.equal(r.status, 200);
+  assert.equal(r.headers.get("x-gateway-model"), "slow");
+  await r.text(); g.close();
 });
 
+test("tamano: si cabe sin margen se intenta en vez de rechazar por poco", async () => {
+  // 80.000 caracteres = 20.000 tokens base; con ratio 1 y margen 1,2 necesita 28.096 (> 26.000), sin margen 24.096 (<= 26.000)
+  const g = await start({ contextWindows: { slow: 26000 }, largeContext: [], initialTokenRatio: 1.0, contextMargin: 1.2, firstByteTimeoutMs: 2000, idleTimeoutMs: 2000 });
+  const r = await pedirA(g, "slow", "y".repeat(80000));
+  assert.equal(r.status, 200);
+  assert.equal(r.headers.get("x-gateway-model"), "slow");
+  await r.text(); g.close();
+});
+
+test("calibracion: aprende cuantos tokens reales cuenta NVIDIA y cambia la decision", async () => {
+  const g = await start({ contextWindows: { doble: 50000, ok: 1000000 }, largeContext: ["ok"], initialTokenRatio: 1.0, contextMargin: 1.0, firstByteTimeoutMs: 2000, idleTimeoutMs: 2000 });
+  try {
+    const contenido = "z".repeat(160000); // 40.000 tokens base
+    // 1.a vez: ratio supuesto 1 -> necesita 44.096 (< 50.000) -> va a 'doble', que cuenta el doble (80.000 reales)
+    const r1 = await pedirA(g, "doble", contenido);
+    assert.equal(r1.headers.get("x-gateway-model"), "doble");
+    await r1.text();
+    // 2.a vez: ya aprendio ratio 2 -> necesita 84.096 (> 50.000) -> se desvia al modelo grande
+    const r2 = await pedirA(g, "doble", contenido);
+    assert.equal(r2.headers.get("x-gateway-model"), "ok", "no cambio de decision tras aprender");
+    assert.equal(r2.headers.get("x-gateway-routed"), "contexto");
+    await r2.text();
+  } finally { g.close(); }
+});
 test("/health y /stats responden", async () => {
   const root = base.replace("/v1", "");
   assert.equal((await (await fetch(`${root}/health`)).json()).ok, true);

@@ -32,7 +32,7 @@
                                                        }
                },
     "routeBySize":  true,
-    "contextMargin":  1.2,
+    "contextMargin":  1.05,
     "largeContext":  [
                          "nvidia/nemotron-3-ultra-550b-a55b",
                          "z-ai/glm-5.3-flash",
