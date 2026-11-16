@@ -21,6 +21,7 @@ export const DEFAULTS = {
   retryAfterCapMs: 15000,
   firstByteMsPer10kTokens: 1000, // espera extra por cada 10k tokens estimados de entrada (conversaciones largas tardan mas en empezar)
   firstByteCapMs: 120000, // tope de la espera ampliada
+  announceSwitch: true, // cuando responde un modelo distinto al pedido, antepone un aviso visible a la respuesta
   allowEnvKey: false, // true = si la peticion no trae clave, usar la variable NVIDIA_API_KEY (solo si la pasarela NO es accesible desde la red)
   routeBySize: true, // elegir modelo segun el tamano de la conversacion
   largeContext: [], // modelos de contexto grande, por orden de preferencia, a los que desviar si el pedido no cabe
@@ -96,6 +97,48 @@ function normalizeMessage(msg) {
     if (reasoning || st.buf) msg.reasoning_content = ((msg.reasoning_content ?? "") + reasoning + (st.inThink ? st.buf : "")).trim();
   }
 }
+
+// ---------- panel en vivo (GET /) ----------
+const DASHBOARD_HTML = `<!doctype html>
+<html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Pasarela NIM</title>
+<style>
+:root{--bg:#fff;--fg:#1a1a1a;--mut:#666;--bd:#ddd;--hd:#f3f3f3;--cambio:#fff3cd;--err:#fde2e2;--ok:#1a7f37}
+@media (prefers-color-scheme:dark){:root{--bg:#161616;--fg:#eee;--mut:#9a9a9a;--bd:#333;--hd:#222;--cambio:#4a3d0a;--err:#4a1c1c;--ok:#4cc26a}}
+body{margin:0;padding:16px;background:var(--bg);color:var(--fg);font:14px system-ui,sans-serif}
+h1{font-size:18px;margin:0 0 4px}.sub{color:var(--mut);margin:0 0 14px}
+.cards{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:14px}.card{border:1px solid var(--bd);border-radius:8px;padding:8px 12px;min-width:110px}
+.card b{display:block;font-size:20px}.card span{color:var(--mut);font-size:12px}
+.wrap{overflow-x:auto}table{border-collapse:collapse;width:100%;min-width:900px}
+th,td{border:1px solid var(--bd);padding:5px 8px;text-align:left;white-space:nowrap}th{background:var(--hd)}
+tr.cambio td{background:var(--cambio)}tr.err td{background:var(--err)}.mut{color:var(--mut)}.pill{font-weight:600}
+</style></head><body>
+<h1>Pasarela NIM</h1>
+<p class="sub">Lo que OpenCode <b>pide</b> frente a lo que <b>responde</b> de verdad. Se actualiza solo cada 2 s. <span id="est" class="mut"></span></p>
+<div class="cards" id="cards"></div>
+<div class="wrap"><table><thead><tr><th>Hora</th><th>Pidió</th><th>Respondió</th><th>Motivo del cambio</th><th>Intentos</th><th>1.er fragmento</th><th>Total</th><th>Tokens ent./sal.</th><th>Estado</th></tr></thead><tbody id="filas"></tbody></table></div>
+<script>
+const esc=s=>String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const corto=m=>String(m??"").replace(/^nvidia\\//,"");
+const ms=v=>v==null?"–":(v>=1000?(v/1000).toFixed(1)+" s":v+" ms");
+async function cargar(){
+  try{
+    const d=await (await fetch("/stats?n=60")).json(); const r=d.recent.slice().reverse();
+    const cambios=r.filter(x=>x.finalModel!==x.model).length, errores=r.filter(x=>!x.ok).length;
+    document.getElementById("cards").innerHTML=
+      '<div class="card"><b>'+r.length+'</b><span>últimas peticiones</span></div>'+
+      '<div class="card"><b>'+cambios+'</b><span>con cambio de modelo</span></div>'+
+      '<div class="card"><b>'+errores+'</b><span>con error</span></div>'+
+      Object.entries(d.models).map(([k,v])=>'<div class="card"><b>'+v.requests+'</b><span>'+esc(corto(k))+' · '+v.fallbacks+' cambios · '+ms(v.ttfbMedianMs)+'</span></div>').join("");
+    document.getElementById("filas").innerHTML=r.map(x=>{
+      const cambio=x.finalModel!==x.model;
+      return '<tr class="'+(!x.ok?"err":cambio?"cambio":"")+'"><td>'+new Date(x.ts).toLocaleTimeString("es-CO")+'</td><td>'+esc(corto(x.model))+'</td><td class="pill">'+esc(corto(x.finalModel))+(cambio?' ⚠':'')+'</td><td>'+esc(x.switchReason||(cambio?"cambio":"–"))+'</td><td>'+x.attempts+'</td><td>'+ms(x.ttfbMs)+'</td><td>'+ms(x.totalMs)+'</td><td>'+(x.tokens?x.tokens.in.toLocaleString("es-CO")+" / "+x.tokens.out.toLocaleString("es-CO"):"–")+'</td><td>'+(x.ok?'<span style="color:var(--ok)">'+esc(x.finish||"ok")+'</span>':esc(x.status+" "+(x.error||"")).slice(0,90))+'</td></tr>';
+    }).join("")||'<tr><td colspan="9" class="mut">Aún no ha pasado ninguna petición por la pasarela.</td></tr>';
+    document.getElementById("est").textContent="· actualizado "+new Date().toLocaleTimeString("es-CO");
+  }catch(e){document.getElementById("est").textContent="· sin conexión con la pasarela";}
+}
+cargar();setInterval(cargar,2000);
+</script></body></html>`;
 
 // ---------- utilidades ----------
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -176,6 +219,14 @@ export function createGateway(cfgIn = {}) {
     return m.patch ? { ...out, ...m.patch } : out;
   }
 
+  // Aviso visible cuando responde un modelo distinto al que pidio el cliente (OpenCode solo muestra el que elegiste).
+  function noticeText(state, requested, actual) {
+    const why = state.routedBy
+      ? "su contexto no admitía la conversación"
+      : (state.attempts.find((a) => a.model === requested && a.result !== "ok")?.result ?? "no respondió");
+    return `[Pasarela: respondió ${actual} en lugar de ${requested} (${why})]\n\n`;
+  }
+
   // Un intento contra un modelo. Devuelve {done:true} si ya respondio al cliente, o {fail, retriable, ...}.
   async function tryOnce({ req, res, auth, body, model, wantStream, t0, state }) {
     const m = mcfg(model);
@@ -212,6 +263,7 @@ export function createGateway(cfgIn = {}) {
       clearTimeout(timer);
       let json; try { json = JSON.parse(text); } catch { return { fail: "respuesta no es JSON", retriable: true }; }
       if (cfg.normalizeReasoning) for (const c of json.choices || []) normalizeMessage(c.message);
+      if (cfg.announceSwitch && model !== body.model) { const msg = json.choices?.[0]?.message; if (msg) msg.content = noticeText(state, body.model, model) + (msg.content ?? ""); }
       state.ttfbMs = Date.now() - t0; state.finish = json.choices?.[0]?.finish_reason; state.usage = json.usage;
       res.writeHead(200, { "content-type": "application/json", "x-gateway-model": model, "x-gateway-attempts": String(state.attempts.length + 1), ...(state.routedBy ? { "x-gateway-routed": state.routedBy } : {}) });
       res.end(JSON.stringify(json));
@@ -228,6 +280,9 @@ export function createGateway(cfgIn = {}) {
       committed = true;
       state.ttfbMs = Date.now() - t0;
       res.writeHead(200, { "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-cache", connection: "keep-alive", "x-gateway-model": model, "x-gateway-attempts": String(state.attempts.length + 1), ...(state.routedBy ? { "x-gateway-routed": state.routedBy } : {}) });
+      if (cfg.announceSwitch && model !== body.model) {
+        sseWrite(res, { id: "pasarela", object: "chat.completion.chunk", model, choices: [{ index: 0, delta: { role: "assistant", content: noticeText(state, body.model, model) }, finish_reason: null }] });
+      }
     };
     const processEvent = (ev) => {
       const line = ev.split("\n").find((l) => l.startsWith("data:"));
@@ -346,7 +401,10 @@ export function createGateway(cfgIn = {}) {
       res.end(JSON.stringify({ error: { message: `Pasarela: todos los intentos fallaron (${state.attempts.map((x) => `${x.model}: ${x.result}`).join("; ")})`, type: "gateway_error", attempts: state.attempts } }));
       state.error = last?.result;
     }
-    record({ ts: new Date().toISOString(), model, finalModel, stream: wantStream, ok, status: result?.passthrough ?? (ok ? 200 : 502), attempts: state.attempts.length, est: state.est ?? null, ratio: state.ratio ? Math.round(state.ratio * 100) / 100 : null, need: state.need ?? null, routedBy: state.routedBy ?? null, ttfbMs: state.ttfbMs ?? null, totalMs: Date.now() - t0, finish: state.finish ?? null, tokens: state.usage ? { in: state.usage.prompt_tokens, out: state.usage.completion_tokens } : null, error: state.error ?? null, clientGone });
+    const switchReason = finalModel !== model
+      ? (state.routedBy ? "tamaño de contexto" : `fallo: ${state.attempts.find((a) => a.model === model && a.result !== "ok")?.result ?? "sin respuesta"}`)
+      : null;
+    record({ ts: new Date().toISOString(), model, finalModel, switchReason, stream: wantStream, ok, status: result?.passthrough ?? (ok ? 200 : 502), attempts: state.attempts.length, est: state.est ?? null, ratio: state.ratio ? Math.round(state.ratio * 100) / 100 : null, need: state.need ?? null, routedBy: state.routedBy ?? null, ttfbMs: state.ttfbMs ?? null, totalMs: Date.now() - t0, finish: state.finish ?? null, tokens: state.usage ? { in: state.usage.prompt_tokens, out: state.usage.completion_tokens } : null, error: state.error ?? null, clientGone });
   }
 
   async function passthrough(req, res, raw) {
@@ -362,11 +420,13 @@ export function createGateway(cfgIn = {}) {
 
   const server = http.createServer(async (req, res) => {
     const p = req.url.split("?")[0];
+    if (p === "/" || p === "/dashboard") { res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" }); res.end(DASHBOARD_HTML); return; }
     if (p === "/health") { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify({ ok: true, upstream: cfg.upstream, queue: sem.q.length, free: sem.n })); return; }
     if (p === "/stats") {
       const models = Object.fromEntries(Object.entries(agg).map(([k, v]) => [k, { requests: v.requests, ok: v.ok, errors: v.errors, fallbacks: v.fallbacks, ttfbMedianMs: median(v.ttfb) }]));
       res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify({ models, recent: recent.slice(-20) }, null, 2));
+      const n = Math.min(200, Number(new URL(req.url, "http://x").searchParams.get("n")) || 20);
+      res.end(JSON.stringify({ models, recent: recent.slice(-n) }, null, 2));
       return;
     }
     let raw = "";

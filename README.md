@@ -19,7 +19,9 @@ No guarda ninguna clave: reenvia la cabecera `Authorization` que manda OpenCode.
 - **Cola:** limita las peticiones simultaneas hacia NVIDIA (`maxConcurrent`) para no provocar 429.
 - **Limite de salida:** si la peticion no trae `max_tokens`, pone `defaultMaxTokens` (evita llamadas a herramientas cortadas por un tope bajo).
 - **Razonamiento:** convierte `reasoning` y las etiquetas `<think>...</think>` en `reasoning_content`, que es lo que OpenCode entiende.
-- **Estadisticas:** `GET /stats` (por modelo: peticiones, errores, cambios de modelo, mediana del primer fragmento) y registro en `logs/gateway.jsonl`. Cuando NVIDIA rechaza una peticion (400, 422...) el motivo queda en el campo `error`.
+- **Panel en vivo:** abre `http://localhost:8780/`. Cada fila muestra lo que el cliente **pidio** frente a lo que **respondio de verdad**, con el motivo cuando cambia (fallo del modelo o tamano de contexto), intentos, tiempos y tokens. OpenCode solo muestra el modelo que elegiste: este panel es la fuente de verdad.
+- **Aviso en la respuesta:** si responde un modelo distinto al pedido, la pasarela antepone a la respuesta `[Pasarela: respondio X en lugar de Y (motivo)]`, para que lo veas dentro de OpenCode. Se desactiva con `"announceSwitch": false`.
+- **Estadisticas:** `GET /stats` (admite `?n=` hasta 200 peticiones recientes, con `switchReason`) (por modelo: peticiones, errores, cambios de modelo, mediana del primer fragmento) y registro en `logs/gateway.jsonl`. Cuando NVIDIA rechaza una peticion (400, 422...) el motivo queda en el campo `error`.
 
 ## Uso
 ```bash
@@ -41,6 +43,7 @@ Y en el `opencode.json` del proyecto:
 | `port` / `host` | 8780 / 0.0.0.0 | Donde escucha |
 | `firstByteTimeoutMs` | 45000 | Espera maxima hasta el primer fragmento |
 | `firstByteMsPer10kTokens` / `firstByteCapMs` | 1000 / 120000 | La espera del primer fragmento crece con el tamano de la conversacion (+1 s por cada 10k tokens estimados, con ese tope): las conversaciones largas tardan mas en empezar |
+| `announceSwitch` | true | Anteponer a la respuesta un aviso cuando responde un modelo distinto al pedido |
 | `routeBySize` | true | Elegir modelo segun el tamano de la conversacion |
 | `largeContext` | [] | Modelos de contexto grande, por orden de preferencia, a los que desviar si el pedido no cabe |
 | `contextMargin` / `outputReserve` | 1.05 / 4096 | Margen de seguridad sobre la estimacion ya calibrada y tokens reservados para la respuesta |

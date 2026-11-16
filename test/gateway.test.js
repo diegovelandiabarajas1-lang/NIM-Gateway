@@ -61,7 +61,7 @@ const mock = http.createServer(async (req, res) => {
 
 let gw, base;
 const start = (cfg) => new Promise((resolve) => {
-  const s = createGateway({ upstream: `http://127.0.0.1:${mock.address().port}/v1`, logFile: null, calibrationFile: null, firstByteTimeoutMs: 500, idleTimeoutMs: 600, retryAfterCapMs: 200, retries: 1, ...cfg });
+  const s = createGateway({ upstream: `http://127.0.0.1:${mock.address().port}/v1`, logFile: null, calibrationFile: null, announceSwitch: false, firstByteTimeoutMs: 500, idleTimeoutMs: 600, retryAfterCapMs: 200, retries: 1, ...cfg });
   s.listen(0, "127.0.0.1", () => resolve(s));
 });
 const ask = async (model, { stream = true, headers = {}, extra = {} } = {}) => {
@@ -285,6 +285,47 @@ test("calibracion: aprende cuantos tokens reales cuenta NVIDIA y cambia la decis
     await r2.text();
   } finally { g.close(); }
 });
+test("aviso: si responde otro modelo, la respuesta lo dice (stream y sin stream)", async () => {
+  const g = await start({ announceSwitch: true, fallbacks: { hang: ["ok"] }, nonStreamTimeoutMs: 800 }); // sin stream, un modelo colgado espera nonStreamTimeoutMs
+  try {
+    const s = await readSSE(await pedirA(g, "hang", "hola"));
+    assert.match(s.content, /^\[Pasarela: respondió ok en lugar de hang \(/);
+    assert.ok(s.content.endsWith("Hola mundo"), "el aviso va delante y la respuesta intacta");
+    const b = `http://127.0.0.1:${g.address().port}/v1`;
+    const j = await (await fetch(`${b}/chat/completions`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ model: "hang", stream: false, messages: [] }) })).json();
+    assert.match(j.choices[0].message.content, /^\[Pasarela: respondió ok en lugar de hang/);
+    assert.ok(j.choices[0].message.content.endsWith("Hola"));
+  } finally { g.close(); }
+});
+
+test("aviso: si responde el modelo pedido NO se anade nada, ni con announceSwitch desactivado", async () => {
+  const g = await start({ announceSwitch: true });
+  const s = await readSSE(await pedirA(g, "ok", "hola"));
+  assert.equal(s.content, "Hola mundo");
+  g.close();
+  const g2 = await start({ announceSwitch: false, fallbacks: { hang: ["ok"] } });
+  const s2 = await readSSE(await pedirA(g2, "hang", "hola"));
+  assert.equal(s2.content, "Hola mundo");
+  g2.close();
+});
+
+test("panel: GET / sirve la pagina y /stats guarda el motivo del cambio", async () => {
+  const g = await start({ fallbacks: { hang: ["ok"] } });
+  try {
+    await (await pedirA(g, "hang", "hola")).text();
+    const root = `http://127.0.0.1:${g.address().port}`;
+    const html = await fetch(`${root}/`);
+    assert.equal(html.status, 200);
+    assert.match(html.headers.get("content-type"), /text\/html/);
+    assert.match(await html.text(), /Pasarela NIM/);
+    const st = await (await fetch(`${root}/stats?n=1`)).json();
+    assert.equal(st.recent.length, 1);
+    assert.equal(st.recent[0].model, "hang");
+    assert.equal(st.recent[0].finalModel, "ok");
+    assert.match(st.recent[0].switchReason, /^fallo: /);
+  } finally { g.close(); }
+});
+
 test("/health y /stats responden", async () => {
   const root = base.replace("/v1", "");
   assert.equal((await (await fetch(`${root}/health`)).json()).ok, true);
